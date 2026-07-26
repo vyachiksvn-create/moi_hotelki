@@ -29,18 +29,18 @@ except Exception:
     pass
 
 # === НАСТРОЙКИ ===
-BASE_DIR = Path(r"C:\Users\vyach\Desktop\Новая папка")
-BASE_FOLDER = BASE_DIR / "База"
-NUMBERS_FOLDER = BASE_DIR / "Цифры"
+BASE_DIR = Path(r"C:\Foto")
+BASE_FOLDER = BASE_DIR / "Baza"
+NUMBERS_FOLDER = BASE_DIR / "Tsifry"
 
-OUTPUT_DUPLICATES_MULTI = BASE_DIR / "Новая папка_Дубли (2 и более фото)"
-OUTPUT_DUPLICATES_MULTI.mkdir(exist_ok=True)
+OUTPUT_DUPLICATES_MULTI = BASE_DIR / "Dupes"
+OUTPUT_DUPLICATES_MULTI.mkdir(parents=True, exist_ok=True)
 
-GUYS_FOLDER = BASE_DIR / "Парни"
-GUYS_FOLDER.mkdir(exist_ok=True)
+GUYS_FOLDER = BASE_DIR / "Parni"
+GUYS_FOLDER.mkdir(parents=True, exist_ok=True)
 
 NEAR_DUPLICATES_FOLDER = BASE_DIR / "Sovpadenia"
-NEAR_DUPLICATES_FOLDER.mkdir(exist_ok=True)
+NEAR_DUPLICATES_FOLDER.mkdir(parents=True, exist_ok=True)
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.webp', '.WEBP'}
 
@@ -491,10 +491,8 @@ def main():
 
         if has_doubt:
             target_dir = NEAR_DUPLICATES_FOLDER
-            logging.info(f"FIO near-duplicate (doubt) -> Sovpadenia root: {len(members)} files")
         else:
             target_dir = NEAR_DUPLICATES_FOLDER / representative
-            logging.info(f"FIO duplicate -> Sovpadenia/{target_dir.name}: {len(members)} files")
 
         target_dir.mkdir(parents=True, exist_ok=True)
         for member in members:
