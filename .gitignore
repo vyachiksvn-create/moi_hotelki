@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.embeddings_cache.pkl
+*.log
+*.tmp
+Miniconda3-latest.exe
+cuda_12.4.0_win10.exe
+*.msi
+*.exe
+.idea/
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini
