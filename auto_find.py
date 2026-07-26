@@ -32,6 +32,7 @@ except Exception:
 BASE_DIR = Path(r"C:\Foto")
 BASE_FOLDER = BASE_DIR / "Baza"
 NUMBERS_FOLDER = BASE_DIR / "Tsifry"
+NUMBERS_FOLDER.mkdir(parents=True, exist_ok=True)
 
 OUTPUT_DUPLICATES_MULTI = BASE_DIR / "Dupes"
 OUTPUT_DUPLICATES_MULTI.mkdir(parents=True, exist_ok=True)
@@ -260,8 +261,8 @@ def main():
             print("  🟡 onnxruntime не найден, используем CPU")
 
         try:
-            app = FaceAnalysis(name=CURRENT_INSIGHT_MODEL, root=os.path.join(os.path.expanduser('~'), '.insightface', 'models'))
-            app.prepare(ctx_id=0 if 'CUDAExecutionProvider' in providers else -1, det_size=(640, 640), providers=providers)
+            app = FaceAnalysis(name=CURRENT_INSIGHT_MODEL, root=os.path.join(os.path.expanduser('~'), '.insightface', 'models'), providers=providers)
+            app.prepare(ctx_id=0 if 'CUDAExecutionProvider' in providers else -1, det_size=(640, 640))
             print(f"✅ InsightFace initialized ({CURRENT_INSIGHT_MODEL})")
         except Exception as e:
             print(f"❌ Ошибка инициализации InsightFace: {e}")
@@ -409,6 +410,7 @@ def main():
 
     dup_multi_count = 0
     base_no_match = 0
+    matched_base_files = set()
 
     for base_face in base_faces:
         base_name = base_face['name']
@@ -429,6 +431,8 @@ def main():
             base_no_match += 1
             continue
 
+        matched_base_files.add(base_face['path'])
+
         for idx, _, in matches:
             numbers_faces[idx]['matched'] = True
 
@@ -445,23 +449,9 @@ def main():
         print(f"  👥 {base_name}: {len(matches)} совпадений")
 
     # ============================================================
-    # ШАГ 5. Пост-обработка: не-matched латиница -> Цифры
+    # ШАГ 5. ФИО/ФИ группировка внутри Baza -> Sovpadenia
     # ============================================================
-    print("\n[5/4] Пост-обработка: не-matched латиница -> Цифры...")
-    moved_latin_to_numbers = 0
-    for base_face in base_faces:
-        img_path = base_face['path']
-        if not img_path.exists():
-            continue
-        if has_latin(img_path.name):
-            safe_move(img_path, NUMBERS_FOLDER, img_path.name)
-            moved_latin_to_numbers += 1
-    print(f"  🔤 Латинских файлов без дублей перенесено в Цифры: {moved_latin_to_numbers}")
-
-    # ============================================================
-    # ШАГ 6. ФИО/ФИ группировка внутри Baza -> Sovpadenia
-    # ============================================================
-    print("\n[6/4] ФИО/ФИ группировка внутри Baza...")
+    print("\n[5/4] ФИО/ФИ группировка внутри Baza...")
     remaining_base = [f for f in get_image_paths(BASE_FOLDER) if f.exists()]
     name_groups: Dict[str, List[Path]] = {}
     for img_path in remaining_base:
@@ -500,6 +490,22 @@ def main():
                 moved_near_duplicates += 1
 
     print(f"  👥 Файлов по ФИО/ФИ перемещено в Sovpadenia: {moved_near_duplicates}")
+
+    # ============================================================
+    # ШАГ 6. Пост-обработка: не-matched латиница -> Цифры
+    # ============================================================
+    print("\n[6/4] Пост-обработка: не-matched латиница -> Цифры...")
+    moved_latin_to_numbers = 0
+    for base_face in base_faces:
+        img_path = base_face['path']
+        if not img_path.exists():
+            continue
+        if img_path in matched_base_files:
+            continue
+        if has_latin(img_path.name):
+            safe_move(img_path, NUMBERS_FOLDER, img_path.name)
+            moved_latin_to_numbers += 1
+    print(f"  🔤 Латинских файлов без дублей перенесено в Цифры: {moved_latin_to_numbers}")
 
     # ============================================================
     # ИТОГИ
