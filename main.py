@@ -5,6 +5,7 @@ import pickle
 import logging
 import shutil
 import argparse
+import re
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any
 import cv2
@@ -27,6 +28,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler("app.log", encoding="utf-8"), logging.StreamHandler()]
 )
+
+def has_cyrillic(text: str) -> bool:
+    return bool(re.search(r'[\u0400-\u04FF]', text))
 
 class Config:
     def __init__(self, path="config.json"):
@@ -316,7 +320,14 @@ def find_duplicates(source_folder_key):
 
         if len(group) >= 2:
             representative = group[0]["path"].stem
-            target_dir = dst_dir / representative
+            has_cyrillic_name = any(has_cyrillic(member["path"].name) for member in group)
+            
+            if has_cyrillic_name:
+                target_dir = cfg.folders["baza"] / representative
+                logging.info(f"Кириллица в названии: {len(group)} файлов -> Baza/{target_dir.name}")
+            else:
+                target_dir = dst_dir / representative
+                
             target_dir.mkdir(parents=True, exist_ok=True)
             moved = 0
             for member in group:
@@ -327,6 +338,16 @@ def find_duplicates(source_folder_key):
             logging.info(f"Совпадение ({sim:.2f}): {len(group)} файлов -> {target_dir.name}")
             for member in group[1:]:
                 file_mgr.add_report(group[0]["path"], member["path"], sim)
+
+    # Move non-duplicate files to Baza if source is not Baza
+    if source_folder_key != "baza":
+        moved_to_baza = 0
+        for item in embeddings_data:
+            if item["path"] not in moved_files and item["path"].exists():
+                if file_mgr.safe_move(item["path"], cfg.folders["baza"]):
+                    moved_to_baza += 1
+        if moved_to_baza:
+            logging.info(f"Файлов без дубликатов перемещено в Baza: {moved_to_baza}")
 
     analyzer._save_cache()
     file_mgr.save_report()
