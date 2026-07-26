@@ -102,7 +102,7 @@ class FaceAnalyzer:
             female_prob = float(gender_prob[0])
             male_prob = float(gender_prob[1])
             confidence = max(female_prob, male_prob)
-            male_confidence = male_prob if gender == male_code else female_prob
+            male_confidence = male_prob
             return gender, confidence, male_confidence
         elif isinstance(gender_prob, (int, float, np.floating)):
             prob = float(gender_prob)
@@ -237,26 +237,36 @@ def separate_guys():
     
     moved_count = 0
     no_face_count = 0
+    female_count = 0
+    low_conf_count = 0
+    
     for img_path in tqdm(files, desc="Анализ пола"):
         faces = analyzer.get_faces(img_path)
+        
         if not faces:
             file_mgr.safe_move(img_path, no_face_dir)
             no_face_count += 1
+            logging.debug(f"Baza->Nea (no face): {img_path.name}")
             continue
         
-        male_faces = [
-            f for f in faces 
-            if f["gender"] == cfg.male_gender_code and f["male_confidence"] >= threshold
-        ]
+        best = max(faces, key=lambda x: x["male_confidence"])
+        gender = best["gender"]
+        male_conf = best["male_confidence"]
+        gender_conf = best["gender_conf"]
         
-        if male_faces:
-            best_male = max(male_faces, key=lambda x: x["male_confidence"])
-            logging.debug(f"Мужское лицо в {img_path.name}: уверенность={best_male['male_confidence']:.2f}")
+        if gender == cfg.male_gender_code and male_conf >= threshold:
             file_mgr.safe_move(img_path, dst_dir)
             moved_count += 1
+            logging.debug(f"Baza->Parni: {img_path.name} gender={gender} male_conf={male_conf:.3f}")
+        elif gender == cfg.female_gender_code:
+            female_count += 1
+            logging.debug(f"Baza->stay (female): {img_path.name} gender={gender} male_conf={male_conf:.3f}")
+        else:
+            low_conf_count += 1
+            logging.debug(f"Baza->stay (low conf): {img_path.name} gender={gender} male_conf={male_conf:.3f}")
     
     analyzer._save_cache()
-    logging.info(f"Отбор мужских лиц завершен! Перемещено в Parni: {moved_count}, без лиц в Nea: {no_face_count}")
+    logging.info(f"Отбор мужских лиц завершен! Parni: {moved_count}, Nea: {no_face_count}, Female skipped: {female_count}, Low conf skipped: {low_conf_count}")
 
 def find_duplicates(source_folder_key):
     src_dir = cfg.folders[source_folder_key]
@@ -285,34 +295,42 @@ def find_duplicates(source_folder_key):
     logging.info("Попарное сравнение...")
     processed_pairs = set()
     moved_files = set()
+    groups_found = 0
     
     for i in tqdm(range(len(embeddings_data)), desc="Поиск совпадений"):
+        if embeddings_data[i]["path"] in moved_files:
+            continue
+        group = [embeddings_data[i]]
         for j in range(i + 1, len(embeddings_data)):
+            if embeddings_data[j]["path"] in moved_files:
+                continue
             item1, item2 = embeddings_data[i], embeddings_data[j]
-            
             pair_key = tuple(sorted([str(item1["path"]), str(item2["path"])]))
             if pair_key in processed_pairs:
                 continue
             processed_pairs.add(pair_key)
 
             sim = cosine_similarity([item1["embedding"]], [item2["embedding"]])[0][0]
-            
             if sim >= sim_threshold:
-                logging.info(f"Совпадение: {item1['path'].name} и {item2['path'].name} ({sim:.2f})")
-                
-                if str(item1["path"]) not in moved_files:
-                    file_mgr.safe_move(item1["path"], dst_dir, suffix="_match1")
-                    moved_files.add(str(item1["path"]))
-                
-                if str(item2["path"]) not in moved_files:
-                    file_mgr.safe_move(item2["path"], dst_dir, suffix="_match2")
-                    moved_files.add(str(item2["path"]))
-                
-                file_mgr.add_report(item1["path"], item2["path"], sim)
+                group.append(embeddings_data[j])
+
+        if len(group) >= 2:
+            representative = group[0]["path"].stem
+            target_dir = dst_dir / representative
+            target_dir.mkdir(parents=True, exist_ok=True)
+            moved = 0
+            for member in group:
+                if file_mgr.safe_move(member["path"], target_dir):
+                    moved += 1
+                    moved_files.add(member["path"])
+            groups_found += 1
+            logging.info(f"Совпадение ({sim:.2f}): {len(group)} файлов -> {target_dir.name}")
+            for member in group[1:]:
+                file_mgr.add_report(group[0]["path"], member["path"], sim)
 
     analyzer._save_cache()
     file_mgr.save_report()
-    logging.info(f"Поиск дубликатов завершен! Перемещено без лиц в Nea: {moved_no_face}")
+    logging.info(f"Поиск дубликатов завершен! Групп: {groups_found}, без лиц в Nea: {moved_no_face}")
 
 def auto_pipeline():
     logging.info("=== ЗАПУСК ПОЛНОГО АВТОМАТИЧЕСКОГО ПАЙПЛАЙНА ===")
@@ -335,7 +353,28 @@ def main():
         action="store_true",
         help="Тест определения пола на первых 5 фото из Baza"
     )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Очистить папки Parni, Sovpadenia, Nea перед запуском"
+    )
     args = parser.parse_args()
+    
+    if args.reset:
+        for key in ["parni", "sovpadenia", "nea"]:
+            folder = cfg.folders.get(key)
+            if folder and folder.exists():
+                for f in folder.rglob("*"):
+                    if f.is_file():
+                        try:
+                            src = cfg.folders.get("baza")
+                            if src and src.exists():
+                                shutil.move(str(f), str(src / f.name))
+                            else:
+                                f.unlink()
+                        except Exception as e:
+                            logging.warning(f"Не удалось сбросить {f}: {e}")
+        logging.info("Папки сброшены. Файлы возвращены в Baza.")
     
     print("="*60)
     print(" MOI HOTELKI v2.3 - AVTOMATICHESKIY REZHIM")
