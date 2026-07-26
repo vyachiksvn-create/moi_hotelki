@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import time
+import re
 from pathlib import Path
 import tempfile
 import numpy as np
@@ -37,6 +38,9 @@ OUTPUT_DUPLICATES_MULTI.mkdir(exist_ok=True)
 
 GUYS_FOLDER = BASE_DIR / "Парни"
 GUYS_FOLDER.mkdir(exist_ok=True)
+
+NEAR_DUPLICATES_FOLDER = BASE_DIR / "Sovpadenia"
+NEAR_DUPLICATES_FOLDER.mkdir(exist_ok=True)
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.webp', '.WEBP'}
 
@@ -159,6 +163,41 @@ def is_match(emb1: Optional[np.ndarray], emb2: Optional[np.ndarray]) -> Tuple[bo
     dist = cosine_distance(emb1, emb2)
     threshold = THRESHOLDS_INSIGHT.get(CURRENT_INSIGHT_MODEL, 0.55) if INSIGHTFACE_AVAILABLE else THRESHOLDS_DF.get('Facenet512', 0.60)
     return dist <= threshold, dist
+
+
+def has_latin(text: str) -> bool:
+    return bool(re.search(r'[A-Za-z]', text))
+
+
+def has_cyrillic(text: str) -> bool:
+    return bool(re.search(r'[\u0400-\u04FF]', text))
+
+
+def normalize_name(name: str) -> str:
+    text = Path(name).stem.lower()
+    text = re.sub(r'[^a-zа-яё\s-]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def extract_fio_parts(text: str) -> Tuple[str, str, str]:
+    text = normalize_name(text)
+    parts = text.split()
+    if len(parts) >= 3:
+        return parts[0], parts[1], parts[2]
+    elif len(parts) == 2:
+        return parts[0], parts[1], ''
+    elif len(parts) == 1:
+        return parts[0], '', ''
+    return '', '', ''
+
+
+def name_matches(a: str, b: str) -> Tuple[bool, bool]:
+    fn1, sn1, pn1 = extract_fio_parts(a)
+    fn2, sn2, pn2 = extract_fio_parts(b)
+    exact_fio = bool(fn1 and sn1 and pn1 and fn1 == fn2 and sn1 == sn2 and pn1 == pn2)
+    fi_only = bool(fn1 and sn1 and fn1 == fn2 and sn1 == sn2)
+    return exact_fio, fi_only
 
 
 def safe_move(src: Path, dst_dir: Path, new_name: str) -> Optional[Path]:
@@ -406,6 +445,65 @@ def main():
         print(f"  👥 {base_name}: {len(matches)} совпадений")
 
     # ============================================================
+    # ШАГ 5. Пост-обработка: не-matched латиница -> Цифры
+    # ============================================================
+    print("\n[5/4] Пост-обработка: не-matched латиница -> Цифры...")
+    moved_latin_to_numbers = 0
+    for base_face in base_faces:
+        img_path = base_face['path']
+        if not img_path.exists():
+            continue
+        if has_latin(img_path.name):
+            safe_move(img_path, NUMBERS_FOLDER, img_path.name)
+            moved_latin_to_numbers += 1
+    print(f"  🔤 Латинских файлов без дублей перенесено в Цифры: {moved_latin_to_numbers}")
+
+    # ============================================================
+    # ШАГ 6. ФИО/ФИ группировка внутри Baza -> Sovpadenia
+    # ============================================================
+    print("\n[6/4] ФИО/ФИ группировка внутри Baza...")
+    remaining_base = [f for f in get_image_paths(BASE_FOLDER) if f.exists()]
+    name_groups: Dict[str, List[Path]] = {}
+    for img_path in remaining_base:
+        norm = normalize_name(img_path.name)
+        if not norm:
+            continue
+        fn, sn, pn = extract_fio_parts(norm)
+        key_fio = f"{fn}|{sn}|{pn}"
+        key_fi = f"{fn}|{sn}"
+        name_groups.setdefault(key_fio, []).append(img_path)
+        name_groups.setdefault(key_fi, []).append(img_path)
+
+    seen_groups = set()
+    moved_near_duplicates = 0
+    for key, members in name_groups.items():
+        if len(members) < 2:
+            continue
+        members = sorted(members, key=lambda p: p.name)
+        group_key = tuple(sorted(str(p) for p in members))
+        if group_key in seen_groups:
+            continue
+        seen_groups.add(group_key)
+
+        names = [p.stem for p in members]
+        has_doubt = len(set(extract_fio_parts(n)[2] for n in names)) > 1
+        representative = members[0].stem
+
+        if has_doubt:
+            target_dir = NEAR_DUPLICATES_FOLDER
+            logging.info(f"FIO near-duplicate (doubt) -> Sovpadenia root: {len(members)} files")
+        else:
+            target_dir = NEAR_DUPLICATES_FOLDER / representative
+            logging.info(f"FIO duplicate -> Sovpadenia/{target_dir.name}: {len(members)} files")
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for member in members:
+            if safe_move(member, target_dir, member.name):
+                moved_near_duplicates += 1
+
+    print(f"  👥 Файлов по ФИО/ФИ перемещено в Sovpadenia: {moved_near_duplicates}")
+
+    # ============================================================
     # ИТОГИ
     # ============================================================
     total_time = time.time() - start_time
@@ -417,6 +515,8 @@ def main():
         'male_moved': male_count if INSIGHTFACE_AVAILABLE else 0,
         'female_remaining': female_count if INSIGHTFACE_AVAILABLE else 0,
         'errors': len(debug_log),
+        'moved_latin_to_numbers': moved_latin_to_numbers,
+        'moved_near_duplicates': moved_near_duplicates,
     }
 
     print("\n" + "=" * 60)
@@ -427,6 +527,8 @@ def main():
         print(f"👩 Осталось в Цифры: {stats['female_remaining']}")
     print(f"👥 Групп дублей: {stats['duplicates_multi']}")
     print(f"❓ Без совпадений: {stats['no_match']}")
+    print(f"🔤 Латинских без дублей -> Цифры: {stats['moved_latin_to_numbers']}")
+    print(f"👥 По ФИО/ФИ -> Sovpadenia: {stats['moved_near_duplicates']}")
     if debug_log:
         print("\nЛог ошибок:")
         for err in debug_log:
