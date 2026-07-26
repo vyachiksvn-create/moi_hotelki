@@ -4,7 +4,8 @@
         "baza": "Baza",
         "parni": "Parni",
         "sovpadenia": "Sovpadenia",
-        "nea": "Nea"
+        "nea": "Nea",
+        "tsifry": "Tsifry"
     },
     "cache_file": ".embeddings_cache.pkl",
     "thresholds": {
@@ -14,9 +15,9 @@
         "min_face_size_ratio": 0.05
     },
     "gender_mapping": {
-        "male_gender_code": 0,
-        "female_gender_code": 1,
-        "description": "InsightFace buffalo_l mapping for this dataset: gender=0 means Male, gender=1 means Female"
+        "male_gender_code": 1,
+        "female_gender_code": 0,
+        "description": "InsightFace buffalo_l mapping for this dataset: gender=1 means Male, gender=0 means Female"
     },
     "performance": {
         "cpu_det_size": [320, 320],

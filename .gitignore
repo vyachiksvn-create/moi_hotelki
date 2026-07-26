@@ -1,15 +1,30 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
 .embeddings_cache.pkl
 *.log
 *.tmp
-Miniconda3-latest.exe
-cuda_12.4.0_win10.exe
-*.msi
-*.exe
+
+# IDE / Editor
 .idea/
 .vs/
 .vscode/
+*.swp
+*.swo
+
+# OS
 Thumbs.db
 Desktop.ini
+.DS_Store
+
+# Data / Outputs
+C:\Foto\*
+!C:\Foto/.gitkeep

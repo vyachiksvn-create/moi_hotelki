@@ -6,9 +6,9 @@ set PYTHONIOENCODING=utf-8
 pushd "%~dp0"
 
 if "%~1"=="" (
-    "C:\Users\vyach\AppData\Local\Python\pythoncore-3.14-64\python.exe" main.py --mode 4
+    "C:\Users\vyach\AppData\Local\Python\pythoncore-3.14-64\python.exe" auto_find.py
 ) else (
-    "C:\Users\vyach\AppData\Local\Python\pythoncore-3.14-64\python.exe" main.py %*
+    "C:\Users\vyach\AppData\Local\Python\pythoncore-3.14-64\python.exe" auto_find.py %*
 )
 
 popd

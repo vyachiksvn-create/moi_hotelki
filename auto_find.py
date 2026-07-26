@@ -3,21 +3,14 @@ import sys
 import shutil
 import time
 import re
+import json
 from pathlib import Path
-import tempfile
-import numpy as np
-from PIL import Image
-import warnings
-import cv2
 from typing import Optional, List, Tuple, Dict
+from difflib import SequenceMatcher
 
-try:
-    import insightface
-    from insightface.app import FaceAnalysis
-    INSIGHTFACE_AVAILABLE = True
-except ImportError:
-    INSIGHTFACE_AVAILABLE = False
-    print("⚠️ InsightFace не найден. Переключаюсь на резервный режим DeepFace.")
+import numpy as np
+import cv2
+import warnings
 
 warnings.filterwarnings("ignore")
 
@@ -28,40 +21,85 @@ try:
 except Exception:
     pass
 
+try:
+    import insightface
+    from insightface.app import FaceAnalysis
+    INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    INSIGHTFACE_AVAILABLE = False
+
 # === НАСТРОЙКИ ===
 BASE_DIR = Path(r"C:\Foto")
-BASE_FOLDER = BASE_DIR / "Baza"
-NUMBERS_FOLDER = BASE_DIR / "Tsifry"
+CONFIG_PATH = Path(__file__).with_name("config.json")
+
+DEFAULTS = {
+    "base_directory": str(BASE_DIR),
+    "folders": {
+        "baza": "Baza",
+        "parni": "Parni",
+        "nea": "Nea",
+        "sovpadenia": "Sovpadenia",
+        "tsifry": "Tsifry"
+    },
+    "cache_file": ".embeddings_cache.pkl",
+    "thresholds": {
+        "gender_confidence": 0.7,
+        "similarity_score": 0.78,
+        "min_face_size_ratio": 0.05
+    },
+    "gender_mapping": {
+        "male_gender_code": 0,
+        "female_gender_code": 1
+    },
+    "performance": {
+        "cpu_det_size": [320, 320],
+        "gpu_det_size": [640, 640]
+    }
+}
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cfg.update(data)
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать config.json: {e}")
+    return cfg
+
+
+config = load_config()
+BASE_DIR = Path(config["base_directory"]).resolve()
+BASE_FOLDER = BASE_DIR / config["folders"]["baza"]
+NUMBERS_FOLDER = BASE_DIR / config["folders"]["tsifry"]
 NUMBERS_FOLDER.mkdir(parents=True, exist_ok=True)
 
 OUTPUT_DUPLICATES_MULTI = BASE_DIR / "Dupes"
 OUTPUT_DUPLICATES_MULTI.mkdir(parents=True, exist_ok=True)
 
-GUYS_FOLDER = BASE_DIR / "Parni"
+GUYS_FOLDER = BASE_DIR / config["folders"]["parni"]
 GUYS_FOLDER.mkdir(parents=True, exist_ok=True)
 
-NEAR_DUPLICATES_FOLDER = BASE_DIR / "Sovpadenia"
+NEAR_DUPLICATES_FOLDER = BASE_DIR / config["folders"]["sovpadenia"]
 NEAR_DUPLICATES_FOLDER.mkdir(parents=True, exist_ok=True)
+
+NEA_FOLDER = BASE_DIR / config["folders"]["nea"]
+NEA_FOLDER.mkdir(parents=True, exist_ok=True)
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.webp', '.WEBP'}
 
-THRESHOLDS_INSIGHT = {
-    'arcface_r100_v1': 0.45,
-    'buffalo_l': 0.55
-}
-MIN_AGREE_INSIGHT = 2
 CURRENT_INSIGHT_MODEL = 'buffalo_l'
-GENDER_CONFIDENCE_THRESHOLD = 0.7
+GENDER_CONFIDENCE_THRESHOLD = float(config["thresholds"]["gender_confidence"])
+SIM_THRESHOLD = float(config["thresholds"]["similarity_score"])
+MIN_FACE_RATIO = float(config["thresholds"]["min_face_size_ratio"])
+MALE_GENDER_CODE = int(config["gender_mapping"]["male_gender_code"])
+FEMALE_GENDER_CODE = int(config["gender_mapping"]["female_gender_code"])
 
-if not INSIGHTFACE_AVAILABLE:
-    from deepface import DeepFace
-    MODELS_DF = ['Facenet512', 'ArcFace']
-    THRESHOLDS_DF = {'Facenet512': 0.60, 'ArcFace': 0.50}
-    MIN_AGREE_DF = 2
-    DETECTOR_CHAIN = ['retinaface', 'mtcnn']
-    print("⚠️ Используем резервный режим DeepFace (медленнее)")
-else:
-    print("🚀 Используем InsightFace (быстро и точно)")
+perf = config.get("performance", {})
+CPU_DET_SIZE = tuple(perf.get("cpu_det_size", [320, 320]))
+GPU_DET_SIZE = tuple(perf.get("gpu_det_size", [640, 640]))
 
 
 def get_image_paths(folder: Path) -> List[Path]:
@@ -96,6 +134,22 @@ def get_gender(face) -> Optional[int]:
     return None
 
 
+def check_gender(face) -> str:
+    gender = getattr(face, 'gender', None)
+    gender_prob = getattr(face, 'gender_prob', None)
+    if gender_prob is not None:
+        confidence = float(gender_prob)
+        if confidence < GENDER_CONFIDENCE_THRESHOLD:
+            return 'unknown'
+    if isinstance(gender, (int, np.integer)):
+        g = int(gender)
+        if g == MALE_GENDER_CODE:
+            return 'male'
+        if g == FEMALE_GENDER_CODE:
+            return 'female'
+    return 'unknown'
+
+
 def cosine_distance(emb1, emb2) -> float:
     v1 = np.array(emb1, dtype=np.float32)
     v2 = np.array(emb2, dtype=np.float32)
@@ -106,6 +160,19 @@ def cosine_distance(emb1, emb2) -> float:
     return 1.0 - float(np.dot(v1, v2) / (norm1 * norm2))
 
 
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.array(a, dtype=np.float32).reshape(1, -1)
+    b = np.array(b, dtype=np.float32).reshape(1, -1)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    val = np.dot(a, b.T)
+    if isinstance(val, np.ndarray):
+        val = val.item()
+    return float(val / (norm_a * norm_b))
+
+
 def extract_embeddings_insightface(img_bgr: np.ndarray, app: FaceAnalysis) -> Optional[np.ndarray]:
     faces = app.get(img_bgr)
     if not faces:
@@ -114,64 +181,30 @@ def extract_embeddings_insightface(img_bgr: np.ndarray, app: FaceAnalysis) -> Op
     return faces[0].embedding
 
 
-def extract_embeddings_deepface(image_path: Path, cache: Dict[str, Optional[np.ndarray]], debug_log: list) -> Optional[np.ndarray]:
-    if image_path.name in cache:
-        return cache[image_path.name]
-
-    tmpdir = tempfile.gettempdir()
-    tmp_name = f"tmp_df_{image_path.stem.encode('utf-8').hex()}{image_path.suffix}"
-    tmp_path = Path(tmpdir) / tmp_name
-    embedding = None
-
-    try:
-        shutil.copy2(image_path, tmp_path)
-        for model_name in MODELS_DF:
-            for detector in DETECTOR_CHAIN:
-                try:
-                    result = DeepFace.represent(
-                        str(tmp_path),
-                        model_name=model_name,
-                        detector_backend=detector,
-                        enforce_detection=False,
-                        align=True
-                    )
-                    if result and len(result) > 0:
-                        emb = result[0].get("embedding")
-                        if emb:
-                            embedding = np.array(emb, dtype=np.float32)
-                            cache[image_path.name] = embedding
-                            break
-                except Exception:
-                    continue
-            if embedding is not None:
-                break
-    except Exception as e:
-        debug_log.append(f"❌ DF Error {image_path.name}: {e}")
-        cache[image_path.name] = None
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
-
-    return embedding
-
-
 def is_match(emb1: Optional[np.ndarray], emb2: Optional[np.ndarray]) -> Tuple[bool, float]:
     if emb1 is None or emb2 is None:
         return False, 1.0
     dist = cosine_distance(emb1, emb2)
-    threshold = THRESHOLDS_INSIGHT.get(CURRENT_INSIGHT_MODEL, 0.55) if INSIGHTFACE_AVAILABLE else THRESHOLDS_DF.get('Facenet512', 0.60)
-    return dist <= threshold, dist
+    return dist <= SIM_THRESHOLD, dist
 
 
 def has_latin(text: str) -> bool:
-    return bool(re.search(r'[A-Za-z]', text))
+    has_lat = bool(re.search(r'[A-Za-z]', text))
+    has_cyr = bool(re.search(r'[\u0400-\u04FF]', text))
+    return has_lat and not has_cyr
 
 
-def has_cyrillic(text: str) -> bool:
-    return bool(re.search(r'[\u0400-\u04FF]', text))
+def is_fio_match(fio1: str, fio2: str) -> bool:
+    parts1 = normalize_fio(fio1).split()
+    parts2 = normalize_fio(fio2).split()
+    if len(parts1) < 2 or len(parts2) < 2:
+        return False
+    sim_surname = SequenceMatcher(None, parts1[0], parts2[0]).ratio()
+    sim_name = SequenceMatcher(None, parts1[1], parts2[1]).ratio()
+    if len(parts1) >= 3 and len(parts2) >= 3:
+        sim_patr = SequenceMatcher(None, parts1[2], parts2[2]).ratio()
+        return sim_surname > 0.85 and sim_name > 0.85 and sim_patr > 0.85
+    return sim_surname > 0.85 and sim_name > 0.85
 
 
 def normalize_name(name: str) -> str:
@@ -179,6 +212,25 @@ def normalize_name(name: str) -> str:
     text = re.sub(r'[^a-zа-яё\s-]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+def has_cyrillic(text: str) -> bool:
+    return bool(re.search(r'[\u0400-\u04FF]', text))
+
+
+def normalize_fio(filename: str) -> str:
+    name = Path(filename).stem
+    name = re.sub(r'\s*\(\d+\)\s*', '', name)
+    name = re.sub(r'[_\-]\d+$', '', name)
+    name = re.sub(r'[^\w\s\-]', '', name)
+    return name.strip().lower()
+
+
+def has_fio(filename: str) -> bool:
+    name = Path(filename).stem
+    words = re.findall(r'[А-Яа-яЁё\-]+', name)
+    valid_words = [w for w in words if len(w) > 3]
+    return len(valid_words) >= 2
 
 
 def extract_fio_parts(text: str) -> Tuple[str, str, str]:
@@ -202,6 +254,8 @@ def name_matches(a: str, b: str) -> Tuple[bool, bool]:
 
 
 def safe_move(src: Path, dst_dir: Path, new_name: str) -> Optional[Path]:
+    if not src.exists():
+        return None
     dst = dst_dir / new_name
     if not dst.exists():
         try:
@@ -225,13 +279,91 @@ def safe_move(src: Path, dst_dir: Path, new_name: str) -> Optional[Path]:
         return None
 
 
+def find_visual_duplicates(files_data: List[dict], threshold: float = 0.78) -> List[List[dict]]:
+    groups: List[List[dict]] = []
+    used = set()
+    for i, file1 in enumerate(files_data):
+        if i in used:
+            continue
+        if file1.get('embedding') is None:
+            continue
+        current_group = [file1]
+        used.add(i)
+        for j, file2 in enumerate(files_data):
+            if i == j or j in used:
+                continue
+            if file2.get('embedding') is None:
+                continue
+            g1 = file1.get('gender', 'unknown')
+            g2 = file2.get('gender', 'unknown')
+            if g1 != 'unknown' and g2 != 'unknown' and g1 != g2:
+                continue
+            sim = cosine_similarity(file1['embedding'], file2['embedding'])
+            if sim >= threshold:
+                current_group.append(file2)
+                used.add(j)
+        if len(current_group) > 1:
+            groups.append(current_group)
+    return groups
+
+
+def finalize_pipeline(base_dir: Path):
+    sovpadeniya_dir = base_dir / "Sovpadenia"
+    baza_after_dir = base_dir / "Baza после"
+    baza_after_dir.mkdir(parents=True, exist_ok=True)
+    print("\n[final] Финальная очистка...")
+    moved = 0
+    if not sovpadeniya_dir.exists():
+        return moved
+    for item in sovpadeniya_dir.iterdir():
+        try:
+            if item.is_file():
+                dst = baza_after_dir / item.name
+                if not dst.exists():
+                    shutil.move(str(item), str(dst))
+                    moved += 1
+            elif item.is_dir():
+                files = [f for f in item.iterdir() if f.is_file()]
+                if len(files) == 1:
+                    dst = baza_after_dir / files[0].name
+                    if not dst.exists():
+                        shutil.move(str(files[0]), str(dst))
+                        moved += 1
+                    try:
+                        item.rmdir()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"  ❌ Ошибка финализации {item}: {e}")
+    print(f"  📦 Файлов возвращено в Baza после: {moved}")
+    return moved
+
+
 def main():
+    try:
+        os.environ['PYTHONUTF8'] = '1'
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+    if not INSIGHTFACE_AVAILABLE:
+        print("❌ InsightFace не найден. Установите: pip install insightface")
+        sys.exit(1)
+
     start_time = time.time()
+    BAZA_AFTER = BASE_DIR / "Baza после"
+    BAZA_AFTER.mkdir(parents=True, exist_ok=True)
+
     print("=" * 60)
-    print("🚀 ПОИСК ДУБЛЕЙ: БАЗА → ЦИФРЫ")
+    print("🚀 ОРГАНИЗАЦИЯ ФОТО: БАЗА → ПАРНИ / NEA / СОВПАДЕНИЯ / ЦИФРЫ / BAZA POSLE")
     print(f"📁 База: {BASE_FOLDER}")
-    print(f"🔢 Цифры: {NUMBERS_FOLDER}")
+    print(f"📄 Файл: {Path(__file__).resolve()}")
     print(f"👦 Парни: {GUYS_FOLDER}")
+    print(f"👩 Nea: {NEA_FOLDER}")
+    print(f"👥 Совпадения: {NEAR_DUPLICATES_FOLDER}")
+    print(f"🔢 Цифры: {NUMBERS_FOLDER}")
+    print(f"📁 Baza после: {BAZA_AFTER}")
     print("=" * 60)
 
     for f in OUTPUT_DUPLICATES_MULTI.iterdir():
@@ -242,10 +374,8 @@ def main():
                 pass
 
     debug_log = []
-    numbers_embeddings_cache: Dict[str, Optional[np.ndarray]] = {}
-    base_embeddings_cache: Dict[str, Optional[np.ndarray]] = {}
+    processed_files = set()
 
-    # Инициализация InsightFace
     app = None
     if INSIGHTFACE_AVAILABLE:
         try:
@@ -261,278 +391,203 @@ def main():
             print("  🟡 onnxruntime не найден, используем CPU")
 
         try:
+            det_size = GPU_DET_SIZE if 'CUDAExecutionProvider' in providers else CPU_DET_SIZE
             app = FaceAnalysis(name=CURRENT_INSIGHT_MODEL, root=os.path.join(os.path.expanduser('~'), '.insightface', 'models'), providers=providers)
-            app.prepare(ctx_id=0 if 'CUDAExecutionProvider' in providers else -1, det_size=(640, 640))
+            app.prepare(ctx_id=0 if 'CUDAExecutionProvider' in providers else -1, det_size=det_size)
             print(f"✅ InsightFace initialized ({CURRENT_INSIGHT_MODEL})")
         except Exception as e:
             print(f"❌ Ошибка инициализации InsightFace: {e}")
             sys.exit(1)
 
     # ============================================================
-    # ШАГ 1. Разделение по полу: Цифры → Парни
+    # ШАГ 1. Сначала выносим ФИО в Совпадения по нечеткому совпадению
     # ============================================================
-    print("\n[1/4] Разделение по полу (Цифры → Парни)...")
-    male_count = 0
-    female_count = 0
-    no_gender_count = 0
-
-    if INSIGHTFACE_AVAILABLE:
-        numbers_images = get_image_paths(NUMBERS_FOLDER)
-        print(f"  Найдено файлов в цифрах: {len(numbers_images)}")
-
-        for idx, img in enumerate(numbers_images, 1):
-            if idx % 10 == 0 or idx == len(numbers_images):
-                print(f"  Обработка: {idx}/{len(numbers_images)}")
-
-            img_bgr = load_image(img)
-            if img_bgr is None:
-                no_gender_count += 1
-                continue
-
-            try:
-                faces = app.get(img_bgr)
-                if not faces:
-                    no_gender_count += 1
-                    continue
-
-                faces = sort_faces_by_size(faces)
-                gender = get_gender(faces[0])
-
-                if gender == 0:  # male
-                    safe_move(img, GUYS_FOLDER, img.name)
-                    male_count += 1
-                elif gender == 1:  # female
-                    female_count += 1
-                    # Сохраняем эмбеддинг для последующего использования
-                    numbers_embeddings_cache[img.name] = faces[0].embedding
-                else:
-                    no_gender_count += 1
-                    # Сохраняем None, чтобы не обрабатывать повторно
-                    numbers_embeddings_cache[img.name] = None
-            except Exception as e:
-                debug_log.append(f"❌ Ошибка обработки {img.name}: {e}")
-                no_gender_count += 1
-                numbers_embeddings_cache[img.name] = None
-
-        print(f"  👦 Мужчин перенесено в Парни: {male_count}")
-        print(f"  👩 Женщин осталось в Цифры: {female_count}")
-        print(f"  ❓ Пол не определён: {no_gender_count}")
-    else:
-        print("  ⚠️ InsightFace недоступен — пропуск разделения по полу")
-
-    # ============================================================
-    # ШАГ 2. База — загрузка эмбеддингов
-    # ============================================================
-    print("\n[2/4] Загрузка базы...")
+    print("\n[1/5] ФИО/ФИ группировка (fuzzy)...")
     base_images = get_image_paths(BASE_FOLDER)
     print(f"  Найдено файлов в базе: {len(base_images)}")
 
-    base_faces = []
-    for idx, img in enumerate(base_images, 1):
-        if idx % 10 == 0 or idx == len(base_images):
-            print(f"  База: {idx}/{len(base_images)}")
-
-        if img.name in base_embeddings_cache:
-            emb = base_embeddings_cache[img.name]
-        else:
-            if INSIGHTFACE_AVAILABLE and app is not None:
-                img_bgr = load_image(img)
-                if img_bgr is not None:
-                    emb = extract_embeddings_insightface(img_bgr, app)
-                else:
-                    emb = None
-            else:
-                emb = extract_embeddings_deepface(img, base_embeddings_cache, debug_log)
-            base_embeddings_cache[img.name] = emb
-
-        if emb is not None:
-            base_faces.append({
-                'embedding': emb,
-                'path': img,
-                'name': img.stem,
-                'ext': img.suffix,
-            })
-        else:
-            debug_log.append(f"⚠️ База: {img.name} - лицо не найдено")
-
-    print(f"  ✅ Распознано в базе: {len(base_faces)}")
-
-    if not base_faces:
-        print("❌ В базе нет распознанных лиц. Завершение.")
-        if debug_log:
-            print("\nЛог ошибок:")
-            for err in debug_log:
-                print(f"  {err}")
-        return
-
-    # ============================================================
-    # ШАГ 3. Цифры (оставшиеся после фильтрации по полу)
-    # ============================================================
-    print("\n[3/4] Загрузка цифр...")
-    numbers_images = get_image_paths(NUMBERS_FOLDER)
-    print(f"  Найдено файлов в цифрах: {len(numbers_images)}")
-
-    numbers_faces = []
-    for idx, img in enumerate(numbers_images, 1):
-        if idx % 10 == 0 or idx == len(numbers_images):
-            print(f"  Цифры: {idx}/{len(numbers_images)}")
-
-        if img.name in numbers_embeddings_cache:
-            emb = numbers_embeddings_cache[img.name]
-        else:
-            if INSIGHTFACE_AVAILABLE and app is not None:
-                img_bgr = load_image(img)
-                if img_bgr is not None:
-                    emb = extract_embeddings_insightface(img_bgr, app)
-                else:
-                    emb = None
-            else:
-                emb = extract_embeddings_deepface(img, numbers_embeddings_cache, debug_log)
-            numbers_embeddings_cache[img.name] = emb
-
-        if emb is not None:
-            numbers_faces.append({
-                'embedding': emb,
-                'path': img,
-                'name': img.stem,
-                'ext': img.suffix,
-                'matched': False,
-            })
-        else:
-            debug_log.append(f"⚠️ Цифры: {img.name} - лицо не найдено")
-
-    print(f"  ✅ Распознано в цифрах: {len(numbers_faces)}")
-
-    # ============================================================
-    # ШАГ 4. Поиск дублей
-    # ============================================================
-    print("\n[4/4] Поиск дублей...")
-
-    dup_multi_count = 0
-    base_no_match = 0
-    matched_base_files = set()
-
-    for base_face in base_faces:
-        base_name = base_face['name']
-        base_ext = base_face['ext']
-        base_emb = base_face['embedding']
-
-        matches = []
-        for i, num_face in enumerate(numbers_faces):
-            if num_face['matched']:
-                continue
-            is_matched, dist = is_match(base_emb, num_face['embedding'])
-            if is_matched:
-                matches.append((i, dist))
-
-        matches.sort(key=lambda x: x[1])
-
-        if not matches:
-            base_no_match += 1
+    fio_groups: Dict[str, List[Path]] = {}
+    fio_single = []
+    for img in base_images:
+        if not img.exists():
             continue
-
-        matched_base_files.add(base_face['path'])
-
-        for idx, _, in matches:
-            numbers_faces[idx]['matched'] = True
-
-        dup_multi_count += 1
-        target_dir = OUTPUT_DUPLICATES_MULTI
-
-        base_new_name = f"{base_name}_1{base_ext}"
-        base_new_path = safe_move(base_face['path'], target_dir, base_new_name)
-
-        for i, (idx, dist) in enumerate(matches, start=2):
-            num_face = numbers_faces[idx]
-            num_new_name = f"{base_name}_{i}{num_face['ext']}"
-            safe_move(num_face['path'], target_dir, num_new_name)
-        print(f"  👥 {base_name}: {len(matches)} совпадений")
-
-    # ============================================================
-    # ШАГ 5. ФИО/ФИ группировка внутри Baza -> Sovpadenia
-    # ============================================================
-    print("\n[5/4] ФИО/ФИ группировка внутри Baza...")
-    remaining_base = [f for f in get_image_paths(BASE_FOLDER) if f.exists()]
-    name_groups: Dict[str, List[Path]] = {}
-    for img_path in remaining_base:
-        norm = normalize_name(img_path.name)
-        if not norm:
+        if not has_fio(img.name):
             continue
-        fn, sn, pn = extract_fio_parts(norm)
-        key_fio = f"{fn}|{sn}|{pn}"
-        key_fi = f"{fn}|{sn}"
-        name_groups.setdefault(key_fio, []).append(img_path)
-        name_groups.setdefault(key_fi, []).append(img_path)
+        norm = normalize_fio(img.name)
+        matched_key = None
+        for key in fio_groups.keys():
+            if is_fio_match(norm, key):
+                matched_key = key
+                break
+        if matched_key:
+            fio_groups[matched_key].append(img)
+        else:
+            fio_groups[norm] = [img]
 
-    seen_groups = set()
-    moved_near_duplicates = 0
-    for key, members in name_groups.items():
+    skip_gender = set()
+    for key, members in fio_groups.items():
         if len(members) < 2:
+            fio_single.extend(members)
             continue
         members = sorted(members, key=lambda p: p.name)
-        group_key = tuple(sorted(str(p) for p in members))
-        if group_key in seen_groups:
-            continue
-        seen_groups.add(group_key)
-
-        names = [p.stem for p in members]
-        has_doubt = len(set(extract_fio_parts(n)[2] for n in names)) > 1
-        representative = members[0].stem
-
-        if has_doubt:
-            target_dir = NEAR_DUPLICATES_FOLDER
-        else:
-            target_dir = NEAR_DUPLICATES_FOLDER / representative
-
+        target_dir = NEAR_DUPLICATES_FOLDER / members[0].stem
         target_dir.mkdir(parents=True, exist_ok=True)
         for member in members:
             if safe_move(member, target_dir, member.name):
-                moved_near_duplicates += 1
-
-    print(f"  👥 Файлов по ФИО/ФИ перемещено в Sovpadenia: {moved_near_duplicates}")
+                skip_gender.add(member.name)
+    print(f"  👥 Групп по ФИО/ФИ: {len(fio_groups)}")
+    print(f"  📄 Одиночных ФИО: {len(fio_single)}")
 
     # ============================================================
-    # ШАГ 6. Пост-обработка: не-matched латиница -> Цифры
+    # ШАГ 2. Гендерныйsplit по оставшимся в Baza
     # ============================================================
-    print("\n[6/4] Пост-обработка: не-matched латиница -> Цифры...")
-    moved_latin_to_numbers = 0
-    for base_face in base_faces:
-        img_path = base_face['path']
-        if not img_path.exists():
+    print("\n[2/5] Разделение по полу (База → Парни / Nea)...")
+    remaining = [f for f in get_image_paths(BASE_FOLDER) if f.exists() and f.name not in skip_gender]
+    male_count = 0
+    female_count = 0
+    no_gender_count = 0
+    female_images = []
+    gender_map: Dict[str, str] = {}
+
+    for idx, img in enumerate(remaining, 1):
+        if idx % 10 == 0 or idx == len(remaining):
+            print(f"  Обработка: {idx}/{len(remaining)}")
+        img_bgr = load_image(img)
+        if img_bgr is None:
+            no_gender_count += 1
+            gender_map[img.name] = 'unknown'
             continue
-        if img_path in matched_base_files:
-            continue
-        if has_latin(img_path.name):
-            safe_move(img_path, NUMBERS_FOLDER, img_path.name)
-            moved_latin_to_numbers += 1
-    print(f"  🔤 Латинских файлов без дублей перенесено в Цифры: {moved_latin_to_numbers}")
+        try:
+            faces = app.get(img_bgr) if app is not None else []
+            if not faces:
+                no_gender_count += 1
+                gender_map[img.name] = 'unknown'
+                continue
+            faces = sort_faces_by_size(faces)
+            gender = check_gender(faces[0])
+            if gender == 'unknown':
+                no_gender_count += 1
+                gender_map[img.name] = 'unknown'
+                continue
+            gender_map[img.name] = gender
+            if gender == 'male':
+                if safe_move(img, GUYS_FOLDER, img.name):
+                    male_count += 1
+            else:
+                female_images.append(img)
+        except Exception as e:
+            debug_log.append(f"❌ Ошибка обработки {img.name}: {e}")
+            no_gender_count += 1
+            gender_map[img.name] = 'unknown'
+
+    print(f"  👦 Мужчин перенесено в Парни: {male_count}")
+    print(f"  👩 Женщин на проверке дублей: {len(female_images)}")
+    print(f"  ❓ Пол не определён: {no_gender_count}")
 
     # ============================================================
-    # ИТОГИ
+    # ШАГ 3. Визуальная дедупликация только женских лиц
     # ============================================================
+    print("\n[3/5] Визуальная дедупликация...")
+    visual_data = []
+    for img in female_images:
+        if not img.exists():
+            continue
+        img_bgr = load_image(img)
+        if img_bgr is None:
+            continue
+        try:
+            faces = app.get(img_bgr) if app is not None else []
+            if not faces:
+                continue
+            faces = sort_faces_by_size(faces)
+            emb = faces[0].embedding
+            if emb is None:
+                continue
+            visual_data.append({
+                'filename': img.name,
+                'path': img,
+                'embedding': emb,
+                'gender': gender_map.get(img.name, 'female')
+            })
+        except Exception as e:
+            debug_log.append(f"❌ Ошибка duplicate search {img.name}: {e}")
+
+    dup_groups = find_visual_duplicates(visual_data, threshold=SIM_THRESHOLD)
+    dup_multi_count = 0
+    moved_duplicates = 0
+    for group in dup_groups:
+        if len(group) < 2:
+            continue
+        dup_multi_count += 1
+        group_sorted = sorted(group, key=lambda x: x['filename'])
+        representative = Path(group_sorted[0]['filename']).stem
+        target_dir = NEAR_DUPLICATES_FOLDER / representative
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for member in group_sorted[1:]:
+            if member['path'].exists() and member['filename'] not in processed_files:
+                if safe_move(member['path'], target_dir, member['filename']):
+                    moved_duplicates += 1
+                    processed_files.add(member['filename'])
+
+    print(f"  👥 Групп дублей: {dup_multi_count}")
+    print(f"  📦 Файлов перемещено в Совпадения: {moved_duplicates}")
+
+    # ============================================================
+    # ШАГ 4. Латинские имена без точных совпадений → Цифры
+    # ============================================================
+    print("\n[4/5] Латинские имена → Цифры...")
+    moved_latin = 0
+    remaining_latin = []
+    for folder in [BASE_FOLDER]:
+        if folder.exists():
+            remaining_latin.extend(get_image_paths(folder))
+
+    for img in remaining_latin:
+        if not img.exists() or img.name in skip_gender:
+            continue
+        if has_latin(img.name):
+            if safe_move(img, NUMBERS_FOLDER, img.name):
+                moved_latin += 1
+    print(f"  🔤 Латинских файлов перенесено в Цифры: {moved_latin}")
+
+    # ============================================================
+    # ШАГ 5. Финальная сборка в Baza после и очистка
+    # ============================================================
+    print("\n[5/5] Финальная сборка...")
+    final_count = 0
+    for img in get_image_paths(BASE_FOLDER):
+        if not img.exists() or img.name in skip_gender:
+            continue
+        dst = BAZA_AFTER / img.name
+        if not dst.exists():
+            try:
+                shutil.move(str(img), str(dst))
+                final_count += 1
+            except Exception as e:
+                debug_log.append(f"❌ Ошибка финализации {img.name}: {e}")
+    print(f"  📦 Файлов перенесено в Baza после: {final_count}")
+
+    for member in fio_single:
+        if member.exists():
+            dst = BAZA_AFTER / member.name
+            if not dst.exists():
+                try:
+                    shutil.move(str(member), str(dst))
+                except Exception as e:
+                    debug_log.append(f"❌ Ошибка финализации ФИО {member.name}: {e}")
+
+    # Очистка одиночных файлов/папок в Совпадениях
+    finalized = finalize_pipeline(BASE_DIR)
+
     total_time = time.time() - start_time
-    remaining_count = sum(1 for f in numbers_faces if not f['matched'])
-
-    stats = {
-        'duplicates_multi': dup_multi_count,
-        'no_match': base_no_match + remaining_count,
-        'male_moved': male_count if INSIGHTFACE_AVAILABLE else 0,
-        'female_remaining': female_count if INSIGHTFACE_AVAILABLE else 0,
-        'errors': len(debug_log),
-        'moved_latin_to_numbers': moved_latin_to_numbers,
-        'moved_near_duplicates': moved_near_duplicates,
-    }
-
     print("\n" + "=" * 60)
-    print("🎉 АНАЛИЗ ЗАВЕРШЁН!")
+    print("🎉 ОРГАНИЗАЦИЯ ЗАВЕРШЕНА!")
     print(f"⏱️  Время: {total_time:.1f} сек.")
-    if INSIGHTFACE_AVAILABLE:
-        print(f"👦 Перенесено в Парни: {stats['male_moved']}")
-        print(f"👩 Осталось в Цифры: {stats['female_remaining']}")
-    print(f"👥 Групп дублей: {stats['duplicates_multi']}")
-    print(f"❓ Без совпадений: {stats['no_match']}")
-    print(f"🔤 Латинских без дублей -> Цифры: {stats['moved_latin_to_numbers']}")
-    print(f"👥 По ФИО/ФИ -> Sovpadenia: {stats['moved_near_duplicates']}")
+    print(f"👦 Перенесено в Парни: {male_count}")
+    print(f"👩 Женщин обработано: {len(female_images) - moved_duplicates}")
+    print(f"👥 Групп дублей: {dup_multi_count}")
+    print(f"🔤 Латинских → Цифры: {moved_latin}")
+    print(f"📁 Файлов в Baza после: {final_count}")
     if debug_log:
         print("\nЛог ошибок:")
         for err in debug_log:
