@@ -35,16 +35,35 @@ class Config:
         self.base_dir = Path(self.data["base_directory"]).resolve()
         self.folders = {k: self.base_dir / v for k, v in self.data["folders"].items()}
         self.cache_file = self.base_dir / self.data["cache_file"]
+        self.male_gender_code = int(self.data.get("gender_mapping", {}).get("male_gender_code", 0))
+        self.female_gender_code = int(self.data.get("gender_mapping", {}).get("female_gender_code", 1))
         
         for folder in self.folders.values():
             folder.mkdir(parents=True, exist_ok=True)
+        if "nea" not in self.folders:
+            self.folders["nea"] = self.base_dir / "Nea"
+            self.folders["nea"].mkdir(parents=True, exist_ok=True)
 
 class FaceAnalyzer:
     def __init__(self):
         logging.info("Инициализация модели InsightFace (buffalo_l)...")
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         self.app = FaceAnalysis(name='buffalo_l', providers=providers)
-        self.app.prepare(ctx_id=0, det_size=(640, 640))
+
+        perf = cfg.data.get("performance", {})
+        cpu_det_size = tuple(perf.get("cpu_det_size", [320, 320]))
+        gpu_det_size = tuple(perf.get("gpu_det_size", [640, 640]))
+
+        try:
+            import onnxruntime as ort
+            has_gpu = 'CUDAExecutionProvider' in ort.get_available_providers()
+        except ImportError:
+            has_gpu = False
+
+        det_size = gpu_det_size if has_gpu else cpu_det_size
+        logging.info(f"det_size={det_size}, providers={providers if has_gpu else ['CPUExecutionProvider']}")
+
+        self.app.prepare(ctx_id=0 if has_gpu else -1, det_size=det_size)
         self.cache = self._load_cache()
 
     def _load_cache(self):
@@ -65,8 +84,7 @@ class FaceAnalyzer:
         size = os.path.getsize(filepath)
         return f"{size}_{mtime}"
 
-    @staticmethod
-    def _parse_gender(face) -> Tuple[Optional[int], float, float]:
+    def _parse_gender(self, face) -> Tuple[Optional[int], float, float]:
         if not hasattr(face, 'gender'):
             return None, 0.0, 0.0
         gender = face.gender
@@ -77,18 +95,24 @@ class FaceAnalyzer:
         else:
             return None, 0.0, 0.0
         
+        male_code = cfg.male_gender_code
+        female_code = cfg.female_gender_code
+        
         if isinstance(gender_prob, (list, np.ndarray)) and len(gender_prob) >= 2:
             female_prob = float(gender_prob[0])
             male_prob = float(gender_prob[1])
             confidence = max(female_prob, male_prob)
-            male_confidence = male_prob if gender == 1 else female_prob
+            male_confidence = male_prob if gender == male_code else female_prob
             return gender, confidence, male_confidence
         elif isinstance(gender_prob, (int, float, np.floating)):
             prob = float(gender_prob)
-            male_confidence = prob if gender == 1 else (1.0 - prob)
+            male_confidence = prob if gender == male_code else (1.0 - prob)
             return gender, prob, male_confidence
         else:
-            return gender, 0.5, 0.5 if gender == 1 else 0.0
+            if gender == male_code:
+                return gender, 1.0, 1.0
+            else:
+                return gender, 1.0, 0.0
 
     def get_faces(self, img_path):
         file_hash = self._get_file_hash(img_path)
@@ -130,7 +154,8 @@ class FaceAnalyzer:
                     "gender": f["gender"],
                     "gender_conf": float(f["gender_conf"]),
                     "male_confidence": float(f["male_confidence"]),
-                    "embedding": f["embedding"].tolist()
+                    "embedding": f["embedding"].tolist(),
+                    "bbox": f["bbox"].tolist() if f.get("bbox") is not None else None
                 } for f in result
             ]
         }
@@ -205,16 +230,23 @@ def separate_guys():
     logging.info("Запуск отбора мужских лиц...")
     src_dir = cfg.folders["baza"]
     dst_dir = cfg.folders["parni"]
+    no_face_dir = cfg.folders["nea"]
     threshold = cfg.data["thresholds"]["gender_confidence"]
     
     files = [f for f in src_dir.iterdir() if f.suffix.lower() in ['.jpg', '.jpeg', '.png']]
     
     moved_count = 0
+    no_face_count = 0
     for img_path in tqdm(files, desc="Анализ пола"):
         faces = analyzer.get_faces(img_path)
+        if not faces:
+            file_mgr.safe_move(img_path, no_face_dir)
+            no_face_count += 1
+            continue
+        
         male_faces = [
             f for f in faces 
-            if f["gender"] == 1 and f["male_confidence"] >= threshold
+            if f["gender"] == cfg.male_gender_code and f["male_confidence"] >= threshold
         ]
         
         if male_faces:
@@ -224,19 +256,25 @@ def separate_guys():
             moved_count += 1
     
     analyzer._save_cache()
-    logging.info(f"Отбор мужских лиц завершен! Перемещено файлов: {moved_count}")
+    logging.info(f"Отбор мужских лиц завершен! Перемещено в Parni: {moved_count}, без лиц в Nea: {no_face_count}")
 
 def find_duplicates(source_folder_key):
     src_dir = cfg.folders[source_folder_key]
     dst_dir = cfg.folders["sovpadenia"]
+    no_face_dir = cfg.folders["nea"]
     sim_threshold = cfg.data["thresholds"]["similarity_score"]
     
     files = [f for f in src_dir.iterdir() if f.suffix.lower() in ['.jpg', '.jpeg', '.png']]
     logging.info(f"Загрузка эмбеддингов из {src_dir.name} ({len(files)} файлов)...")
     
     embeddings_data = []
+    moved_no_face = 0
     for img_path in tqdm(files, desc="Извлечение признаков"):
         faces = analyzer.get_faces(img_path)
+        if not faces:
+            file_mgr.safe_move(img_path, no_face_dir)
+            moved_no_face += 1
+            continue
         for i, face in enumerate(faces):
             embeddings_data.append({
                 "path": img_path,
@@ -274,7 +312,7 @@ def find_duplicates(source_folder_key):
 
     analyzer._save_cache()
     file_mgr.save_report()
-    logging.info("Поиск дубликатов завершен!")
+    logging.info(f"Поиск дубликатов завершен! Перемещено без лиц в Nea: {moved_no_face}")
 
 def auto_pipeline():
     logging.info("=== ЗАПУСК ПОЛНОГО АВТОМАТИЧЕСКОГО ПАЙПЛАЙНА ===")

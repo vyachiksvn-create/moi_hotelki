@@ -3,13 +3,26 @@
     "folders": {
         "baza": "Baza",
         "parni": "Parni",
-        "sovpadenia": "Sovpadenia"
+        "sovpadenia": "Sovpadenia",
+        "nea": "Nea"
     },
     "cache_file": ".embeddings_cache.pkl",
     "thresholds": {
         "gender_confidence": 0.7,
+        "gender_confidence_max": 1.0,
         "similarity_score": 0.65,
         "min_face_size_ratio": 0.05
     },
-    "generate_report": true
+    "gender_mapping": {
+        "male_gender_code": 0,
+        "female_gender_code": 1,
+        "description": "InsightFace buffalo_l mapping for this dataset: gender=0 means Male, gender=1 means Female"
+    },
+    "performance": {
+        "cpu_det_size": [320, 320],
+        "gpu_det_size": [640, 640]
+    },
+    "generate_report": true,
+    "review_absolute_confidence": true,
+    "review_folder": "parni_review"
 }
